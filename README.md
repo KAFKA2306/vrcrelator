@@ -1,167 +1,107 @@
-# VRChat AIコンパニオン通信システム（VRC Relator） 全体設計仕様書
+# VRC Relator
 
-## システム概要
+VRChatと外部AIサービスを接続する方法を検討するための設計メモです。
 
-本システムは、VRChat内でユーザーとAIキャラクターがテキスト会話できるミニマルな仕組みを提供します。関心の分離を徹底し、3つの明確な層に分けて設計しています。
+## 現在の状態
 
-### 目的
-最小限の複雑さで、VRChat内でAIコンパニオンとの自然な対話を実現する。
+**このrepositoryには、動作確認済みのVRChat/UdonSharp実装、OSC bridge、AI API client、Prefab、package manifest、test、CIはありません。** 現在の正準treeはREADMEとdocsだけです。そのため、ここに書かれた会話経路を「実装済み」「2秒以内で動作する」「Prefabを置くだけで使える」とは扱いません。
 
-## アーキテクチャ設計
+現時点で確認できるのは、下記の公式仕様を組み合わせれば外部アプリケーションとVRChatを接続する設計余地があることまでです。
 
-### 全体構成（3層アーキテクチャ）
+## 何を作りたいか
 
-```
-[VRChat層]  [通信ブリッジ層]  [AIサービス層]
-```
+目的は「AIキャラクターが自然に会話できる」と先に宣言することではありません。
 
-| 層 | 主な責務 | 技術 | ファイル数 |
-|---|---------|-----|----------|
-| VRChat層 | ユーザー検知・UI表示 | UdonSharp, OSC | 1ファイル |
-| 通信ブリッジ層 | OSC通信・API連携 | Node.js, node-osc | 1ファイル |
-| AIサービス層 | 応答生成 | OpenAI API | 外部サービス |
+**入力 → 外部bridge → AI API → VRChat側の表示**を別々に確認し、どこで失敗したかを切り分けられる最小構成を作ることが目的です。
 
-## コンポーネント詳細設計
+### 設計方針
 
-### 1. VRChat層（AICompanion.cs）
+- 設計例と動作確認済み実装を分ける
+- VRChatで公式に確認できるAPIだけを前提にする
+- 入力、外部通信、AI応答、表示を独立して検証する
+- model名やprovider名を固定しない
+- latencyを保証値にしない
+- API keyや会話本文の保存方針を実装前に明示する
+- 実装が存在しない段階では、toolingや抽象化を先に増やさない
 
-```csharp
-// UdonSharpスクリプト
-public class AICompanion : UdonSharpBehaviour
-{
-    [SerializeField] private Text responseText;  // AIの応答表示用テキスト
-    [SerializeField] private float detectionRadius = 2.0f;  // 検知半径
-    
-    private bool isUserNearby = false;
-    
-    // ユーザー接近検知
-    public override void OnPlayerTriggerEnter(VRCPlayerApi player) {
-        if (player.isLocal) {
-            isUserNearby = true;
-            SendCustomNetworkEvent(NetworkEventTarget.Owner, "SendUserNearbyOSC");
-        }
-    }
-    
-    // ユーザー離脱検知
-    public override void OnPlayerTriggerExit(VRCPlayerApi player) {
-        if (player.isLocal) {
-            isUserNearby = false;
-            SendCustomNetworkEvent(NetworkEventTarget.Owner, "SendUserLeftOSC");
-        }
-    }
-    
-    // VRChatのテキスト入力検知（標準機能使用）
-    public void OnChatBoxSubmit(string message) {
-        SendOSCMessage("/avatar/parameters/userSpeech", message);
-    }
-    
-    // OSC受信（AIからの応答）
-    public void OnOSCMessageReceived(string address, string value) {
-        if (address == "/avatar/parameters/aiResponse") {
-            responseText.text = value;
-        }
-    }
-}
+## 公式仕様から確認できること
+
+### VRChat OSC
+
+VRChat公式ドキュメントでは、OSCで利用できる主要APIとして **Input** と **Avatar Parameters** が案内されています。
+
+- OSC overview: https://docs.vrchat.com/docs/osc-overview
+- OSC as Input Controller: https://docs.vrchat.com/docs/osc-as-input-controller
+- OSC Avatar Parameters: https://docs.vrchat.com/docs/osc-avatar-parameters
+
+既定では、VRChatは **UDP 9000で受信し、9001へ送信**します。外部アプリケーション側からVRChatへ送る場合は9000、VRChatからの値を外部アプリケーションで受ける場合は9001が既定です。
+
+Avatar Parametersで公式に説明されている値型は **Int / Bool / Float** です。したがって、以前のREADMEにあった
+
+```text
+/avatar/parameters/userSpeech = "任意の文字列"
+/avatar/parameters/aiResponse = "任意の文字列"
 ```
 
-### 2. 通信ブリッジ層（bridge.js）
+という方式は、公式Avatar Parameters仕様に基づく実装として扱いません。
 
-```javascript
-// Node.jsブリッジアプリケーション
-const osc = require('node-osc');
-const axios = require('axios');
-require('dotenv').config();
+OSC自体は任意のaddress/valueを扱えるプロトコルですが、VRChatが公開しているOSC APIにはVRChat側の契約があります。外部bridgeを作る場合は、その契約と独自アプリ間の通信を区別する必要があります。
 
-// OSCサーバー（VRChatからの受信用）
-const oscServer = new osc.Server(9001, '0.0.0.0');
+### Udon / UdonSharp
 
-// OSCクライアント（VRChatへの送信用）
-const oscClient = new osc.Client('127.0.0.1', 9000);
+VRChat Creator Documentationでは、`OnPlayerTriggerEnter` / `OnPlayerTriggerExit` は正式なPlayer Eventとして掲載されています。
 
-// OSCメッセージ処理
-oscServer.on('message', async (msg) => {
-    const address = msg[0];
-    const value = msg[1];
-    
-    if (address === '/avatar/parameters/userSpeech') {
-        // AIへのリクエスト処理
-        const aiResponse = await requestAIResponse(value);
-        // 応答をVRChatへ送信
-        oscClient.send('/avatar/parameters/aiResponse', aiResponse);
-    }
-});
+- Event Nodes: https://creators.vrchat.com/worlds/udon/graph/event-nodes/
+- Player Collisions: https://creators.vrchat.com/worlds/udon/players/player-collisions/
 
-// OpenAI APIリクエスト
-async function requestAIResponse(userMessage) {
-    try {
-        const response = await axios.post('https://api.openai.com/v1/chat/completions', {
-            model: 'gpt-3.5-turbo',
-            messages: [
-                {role: 'system', content: 'あなたはVRChat内の親しみやすいAIコンパニオンです。簡潔に応答してください。'},
-                {role: 'user', content: userMessage}
-            ],
-            max_tokens: 100
-        }, {
-            headers: {
-                'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`
-            }
-        });
-        
-        return response.data.choices[0].message.content;
-    } catch (error) {
-        console.error('APIエラー:', error);
-        return 'すみません、応答できませんでした。';
-    }
-}
+一方、以前のREADMEにあった `OnChatBoxSubmit` と `OnOSCMessageReceived` は、今回確認したVRChat公式Udon event一覧では実装根拠を確認できませんでした。このrepositoryでは、これらを動作済みcallbackとして説明しません。
 
-console.log('OSCブリッジ起動中...');
-```
+## AI APIとの境界
 
-### 3. AIサービス層
+外部AIサービスを使う場合、ユーザー入力はVRChat/ローカル環境の外へ送信されます。これは明示的なprivacy boundaryです。
 
-OpenAI APIを直接利用するため、追加実装は不要。
+OpenAI APIを例にすると、現在の公式quickstartはserver-side JavaScriptで公式SDKを使い、API keyを環境変数から読み、Responses APIを呼び出す例を掲載しています。
 
-## データフロー
+- OpenAI API quickstart: https://platform.openai.com/docs/quickstart
+- API authentication: https://platform.openai.com/docs/api-reference/authentication
+- Data controls: https://platform.openai.com/docs/guides/your-data
 
-1. **ユーザー接近時**：
-   - ユーザーがAIの近くに来る → VRChat層でトリガー検知 → OSCで「userNearby=true」送信
+以前のREADMEに固定されていた `gpt-3.5-turbo` と `/v1/chat/completions` を、このprojectの正準仕様にはしません。provider/model/endpointは実装時に現在の公式documentationへ再照合します。
 
-2. **ユーザー発話時**：
-   - ユーザーがテキスト入力 → VRChat層でイベント検知 → OSCで「userSpeech={テキスト}」送信
-   - ブリッジ層受信 → OpenAI APIリクエスト → AI応答取得
-   - ブリッジ層 → OSCで「aiResponse={応答テキスト}」送信
-   - VRChat層受信 → UI更新（テキスト表示）
+API keyはsource codeやVRChat worldへ埋め込まず、外部bridge側のenvironment variableまたはsecret managementで扱う必要があります。
 
-## インターフェース定義
+## 検証したい最小の経路
 
-### OSCパラメータ仕様
+実装する場合は、次の順で一段ずつ証拠を残します。
 
-| パラメータ名 | 方向 | データ型 | 説明 |
-|------------|------|---------|-----|
-| userNearby | VRC→ブリッジ | bool | ユーザーが近くにいるか |
-| userSpeech | VRC→ブリッジ | string | ユーザーの発話内容 |
-| aiResponse | ブリッジ→VRC | string | AIの応答テキスト |
+1. VRChat内で、公式Udon eventを使ってlocal player interactionを検出できる
+2. 外部OSC applicationがVRChatの公式OSC endpointを送受信できる
+3. 外部bridgeが入力をAI providerへ送り、responseを取得できる
+4. AI responseをVRChatで表示するための、公式にサポートされた経路を確定する
+5. API failure / timeout時に明示的なfallbackを表示できる
+6. 会話本文・credential・provider側data retentionの境界を確認する
+7. Unity/VRChatの実機またはBuild & Testでend-to-endを再現する
 
-## 実装と運用ガイドライン
+これらが揃うまでは、MVP完成、導入容易性、応答時間、会話品質を保証しません。
 
-1. **セットアップ簡略化**：
-   - VRChat: 単一Prefabをドラッグ＆ドロップのみ
-   - Node.js: npmコマンド1行でインストール、.envファイルにAPIキーのみ設定
+## 現在の確認表
 
-2. **制約条件**：
-   - 応答速度：2秒以内を目標
-   - テキスト長：VRChat OSC制限内に収める（100トークン程度）
+| 項目 | 状態 | 根拠 |
+|---|---|---|
+| VRChat OSCの既定port 9000/9001 | 公式仕様で確認 | VRChat OSC Overview |
+| Avatar ParametersのInt/Bool/Float | 公式仕様で確認 | VRChat OSC Avatar Parameters |
+| `OnPlayerTriggerEnter/Exit` | 公式仕様で確認 | VRChat Udon Event Nodes |
+| `OnChatBoxSubmit` | 未確認 | 公式Udon event一覧で根拠を確認できず |
+| `OnOSCMessageReceived` | 未確認 | 公式Udon event一覧で根拠を確認できず |
+| VRChat側C#実装 | 未実装 | repositoryにsourceなし |
+| OSC bridge | 未実装 | repositoryにsourceなし |
+| AI API client | 未実装 | repositoryにsourceなし |
+| Prefab | 未実装 | repositoryにassetなし |
+| Unity / VRChat runtime test | 未実施 | test evidenceなし |
+| 2秒以内のresponse | 未検証 | measurementなし |
 
-3. **セキュリティ**：
-   - APIキーは.envで管理
-   - 個人情報はローカルのみで処理
+## 次に実装するなら
 
-## MVP定義（完成基準）
+最初にAI provider adapterや販売用設定schemaを増やすのではなく、**VRChat ↔ 外部applicationの1往復を公式仕様だけで再現**するのが先です。その後にAI APIを外部bridgeへ追加します。
 
-1. ユーザーがAIキャラクターに近づくと検知される
-2. テキストで話しかけるとAIから自然な返答が返る
-3. 会話がスムーズに続けられる（2秒以内の応答）
-
----
-
-**設計思想：** 明確な関心分離、最小限の実装、ユーザー体験の最適化を原則としています。各層は単一ファイルで実装し、拡張性を確保しつつもシンプルさを維持します。
+この順番なら、VRChat側、network、provider側のどこで問題が起きたかを分けて確認できます。
